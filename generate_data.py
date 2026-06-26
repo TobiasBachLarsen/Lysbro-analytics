@@ -6,13 +6,19 @@ This simulates what an ETL extract phase would produce from the production datab
 import random
 import sqlite3
 from datetime import datetime, timedelta
-from pathlib import Path
 
-RANDOM_SEED = 42
-DB_PATH = Path("output/lysbro.db")
-
-PLANS = ["gratis", "pro", "erhverv"]
-PLAN_WEIGHTS = [0.70, 0.22, 0.08]
+from config import (
+    DATE_END,
+    DATE_START,
+    MEETING_DURATIONS,
+    MEETING_TITLES,
+    PLAN_MEETING_RANGE,
+    PLAN_PARTICIPANT_RANGE,
+    PLAN_WEIGHTS,
+    PLANS,
+    RANDOM_SEED,
+    SOURCE_DB as DB_PATH,
+)
 
 NAMES = [
     "Anders Nielsen", "Sofie Hansen", "Mikkel Andersen", "Laura Jensen",
@@ -23,14 +29,6 @@ NAMES = [
     "Tobias Lund", "Ida Mortensen", "Sebastian Dahl", "Nora Berg",
     "Alexander Holm", "Emilie Jakobsen", "Victor Eriksen", "Mathilde Simonsen",
 ]
-
-MEETING_TITLES = [
-    "Ugentligt standup", "Projektmøde", "1:1 med teamleder", "Sprint planning",
-    "Kundemøde", "Demo", "Retrospektiv", "Onboarding", "Strategimøde", "Statusmøde",
-]
-
-PLAN_MEETING_RANGE = {"gratis": (1, 4), "pro": (5, 20), "erhverv": (15, 50)}
-PLAN_PARTICIPANT_RANGE = {"gratis": (1, 2), "pro": (2, 10), "erhverv": (5, 30)}
 
 
 def random_date(start: datetime, end: datetime) -> datetime:
@@ -113,7 +111,7 @@ def seed(db: sqlite3.Connection, start: datetime, end: datetime) -> None:
                     user["id"],
                     random.choice(MEETING_TITLES),
                     random_date(host_start, end).isoformat(),
-                    random.choice([15, 30, 45, 60, 90]),
+                    random.choice(MEETING_DURATIONS),
                     n_participants,
                 ),
             )
@@ -143,4 +141,4 @@ if __name__ == "__main__":
     random.seed(RANDOM_SEED)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as db:
-        seed(db, start=datetime(2025, 1, 1), end=datetime(2026, 6, 1))
+        seed(db, start=datetime.fromisoformat(DATE_START), end=datetime.fromisoformat(DATE_END))
