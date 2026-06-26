@@ -1,0 +1,6 @@
+pandas==2.2.3
+matplotlib==3.9.4
+jupyter==1.1.1
+psycopg2-binary==2.9.10
+supabase==2.31.0
+python-dotenv==1.2.2
