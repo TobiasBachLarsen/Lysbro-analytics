@@ -3,14 +3,19 @@ ETL pipeline — extracts raw Lysbro data from SQLite, transforms it into
 analytics-ready aggregates, and loads results into a separate reporting database.
 """
 
+import logging
 import sqlite3
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 
-SOURCE_DB = Path("output/lysbro.db")
-REPORT_DB = Path("output/lysbro_analytics.db")
+from config import REPORT_DB, SOURCE_DB
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 
 # ── Extract ───────────────────────────────────────────────────────────────────
@@ -130,7 +135,7 @@ def transform(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
 def load(results: dict[str, pd.DataFrame], target: sqlite3.Connection) -> None:
     for table_name, df in results.items():
         df.to_sql(table_name, target, if_exists="replace", index=False)
-        print(f"  loaded '{table_name}' ({len(df)} rows)")
+        logging.info("loaded '%s' (%d rows)", table_name, len(df))
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -142,28 +147,28 @@ def run() -> None:
             "Run `python generate_data.py` first."
         )
 
-    print(f"[{datetime.now():%H:%M:%S}] Starting ETL pipeline")
+    logging.info("Starting ETL pipeline")
 
     try:
         source = sqlite3.connect(SOURCE_DB)
         target = sqlite3.connect(REPORT_DB)
 
-        print("  Extracting...")
+        logging.info("Extracting...")
         raw = extract(source)
         for name, df in raw.items():
-            print(f"    {name}: {len(df)} rows")
+            logging.info("  %s: %d rows", name, len(df))
 
-        print("  Transforming...")
+        logging.info("Transforming...")
         results = transform(raw)
 
-        print("  Loading into reporting database...")
+        logging.info("Loading into reporting database...")
         load(results, target)
 
     finally:
         source.close()
         target.close()
 
-    print(f"[{datetime.now():%H:%M:%S}] Pipeline complete → {REPORT_DB}")
+    logging.info("Pipeline complete → %s", REPORT_DB)
 
 
 if __name__ == "__main__":
