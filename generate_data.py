@@ -103,7 +103,7 @@ def seed(db: sqlite3.Connection, start: datetime, end: datetime) -> None:
         other_ids = [uid for uid in all_user_ids if uid != user["id"]]
 
         for _ in range(random.randint(lo, hi)):
-            n_participants = random.randint(p_lo, p_hi)
+            n_participants = min(random.randint(p_lo, p_hi), len(other_ids))
             db.execute(
                 "INSERT INTO meetings VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -115,7 +115,7 @@ def seed(db: sqlite3.Connection, start: datetime, end: datetime) -> None:
                     n_participants,
                 ),
             )
-            for pid in random.sample(other_ids, min(n_participants, len(other_ids))):
+            for pid in random.sample(other_ids, n_participants):
                 rsvp = random.choices(
                     ["accepted", "pending", "declined"], [0.6, 0.3, 0.1]
                 )[0]
@@ -128,9 +128,13 @@ def seed(db: sqlite3.Connection, start: datetime, end: datetime) -> None:
     # ── Messages ──────────────────────────────────────────────────────────────
     for msg_id in range(1, 501):
         sender, receiver = random.sample(users, 2)
+        msg_start = max(
+            datetime.fromisoformat(sender["created_at"]),
+            datetime.fromisoformat(receiver["created_at"]),
+        )
         db.execute(
             "INSERT INTO messages VALUES (?, ?, ?, ?)",
-            (msg_id, sender["id"], receiver["id"], random_date(start, end).isoformat()),
+            (msg_id, sender["id"], receiver["id"], random_date(msg_start, end).isoformat()),
         )
 
     db.commit()

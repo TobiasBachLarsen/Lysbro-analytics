@@ -96,11 +96,17 @@ def transform(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         .assign(pct=lambda df: (df["count"] / df["count"].sum() * 100).round(1))
     )
 
-    daily_messages = (
+    daily_counts = (
         messages
         .assign(date=messages["sent_at"].dt.normalize())
         .groupby("date")
         .agg(messages_sent=("id", "count"))
+    )
+    full_date_range = pd.date_range(daily_counts.index.min(), daily_counts.index.max(), freq="D")
+    daily_messages = (
+        daily_counts
+        .reindex(full_date_range, fill_value=0)
+        .rename_axis("date")
         .reset_index()
         .assign(
             rolling_7d=lambda df: df["messages_sent"].rolling(7, min_periods=1).mean().round(1),
@@ -108,11 +114,12 @@ def transform(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     )
 
     meetings_per_user_by_plan = (
-        meetings
-        .groupby("host_id")
-        .agg(meeting_count=("id", "count"))
-        .reset_index()
-        .merge(users[["id", "plan"]], left_on="host_id", right_on="id", how="left")
+        users[["id", "plan"]]
+        .merge(
+            meetings.groupby("host_id").agg(meeting_count=("id", "count")).reset_index(),
+            left_on="id", right_on="host_id", how="left",
+        )
+        .assign(meeting_count=lambda df: df["meeting_count"].fillna(0))
         .groupby("plan")
         .agg(avg_meetings=("meeting_count", "mean"))
         .reset_index()
@@ -149,6 +156,8 @@ def run() -> None:
 
     logging.info("Starting ETL pipeline")
 
+    source = None
+    target = None
     try:
         source = sqlite3.connect(SOURCE_DB)
         target = sqlite3.connect(REPORT_DB)
@@ -165,8 +174,10 @@ def run() -> None:
         load(results, target)
 
     finally:
-        source.close()
-        target.close()
+        if source is not None:
+            source.close()
+        if target is not None:
+            target.close()
 
     logging.info("Pipeline complete → %s", REPORT_DB)
 
