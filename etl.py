@@ -1,37 +1,43 @@
 """
 ETL pipeline — extracts raw Lysbro data from SQLite, transforms it into
 analytics-ready aggregates, and loads results into a separate reporting database.
+
+Each aggregate is a small pure function of the raw tables (see TRANSFORMS), which
+keeps them individually testable and makes adding a new report a one-line change.
 """
 
 import logging
 import sqlite3
-from datetime import datetime
+from collections.abc import Callable
+from contextlib import closing
 
 import pandas as pd
 
 from config import REPORT_DB, SOURCE_DB
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+log = logging.getLogger(__name__)
+
+RawTables = dict[str, pd.DataFrame]
+
+SOURCE_TABLES = {
+    "users": "users",
+    "meetings": "meetings",
+    "rsvps": "meeting_participants",
+    "messages": "messages",
+}
+TIMESTAMP_COLUMNS = ("created_at", "scheduled_at", "sent_at")
+TOP_HOSTS_LIMIT = 10
+ROLLING_WINDOW_DAYS = 7
 
 
 # ── Extract ───────────────────────────────────────────────────────────────────
 
-def extract(source: sqlite3.Connection) -> dict[str, pd.DataFrame]:
-    tables = {
-        "users":    "SELECT * FROM users",
-        "meetings": "SELECT * FROM meetings",
-        "rsvps":    "SELECT * FROM meeting_participants",
-        "messages": "SELECT * FROM messages",
-    }
-    raw: dict[str, pd.DataFrame] = {}
-    for name, query in tables.items():
-        df = pd.read_sql(query, source)
-        # Parse ISO-8601 timestamp columns after loading (parse_dates is deprecated)
-        for col in ("created_at", "scheduled_at", "sent_at"):
+
+def extract(source: sqlite3.Connection) -> RawTables:
+    raw: RawTables = {}
+    for name, table in SOURCE_TABLES.items():
+        df = pd.read_sql(f"SELECT * FROM {table}", source)
+        for col in TIMESTAMP_COLUMNS:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col])
         raw[name] = df
@@ -40,147 +46,154 @@ def extract(source: sqlite3.Connection) -> dict[str, pd.DataFrame]:
 
 # ── Transform ─────────────────────────────────────────────────────────────────
 
-def transform(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
-    users    = raw["users"]
-    meetings = raw["meetings"]
-    rsvps    = raw["rsvps"]
-    messages = raw["messages"]
 
-    plan_distribution = (
-        users.groupby("plan")
-        .agg(user_count=("id", "count"))
-        .reset_index()
-    )
+def _month(series: pd.Series) -> pd.Series:
+    return series.dt.to_period("M").astype(str)
 
-    monthly_signups = (
-        users
-        .assign(month=users["created_at"].dt.to_period("M"))
+
+def plan_distribution(raw: RawTables) -> pd.DataFrame:
+    return raw["users"].groupby("plan").agg(user_count=("id", "count")).reset_index()
+
+
+def monthly_signups(raw: RawTables) -> pd.DataFrame:
+    users = raw["users"]
+    return (
+        users.assign(month=_month(users["created_at"]))
         .groupby("month")
         .agg(signups=("id", "count"))
         .reset_index()
-        .assign(month=lambda df: df["month"].astype(str))
     )
 
-    monthly_meetings = (
-        meetings
-        .assign(month=meetings["scheduled_at"].dt.to_period("M"))
+
+def monthly_meetings(raw: RawTables) -> pd.DataFrame:
+    meetings = raw["meetings"]
+    return (
+        meetings.assign(month=_month(meetings["scheduled_at"]))
         .groupby("month")
-        .agg(
-            meeting_count=("id", "count"),
-            avg_participants=("participant_count", "mean"),
-        )
+        .agg(meeting_count=("id", "count"), avg_participants=("participant_count", "mean"))
         .reset_index()
-        .assign(
-            month=lambda df: df["month"].astype(str),
-            avg_participants=lambda df: df["avg_participants"].round(1),
-        )
+        .assign(avg_participants=lambda df: df["avg_participants"].round(1))
     )
 
-    top_hosts = (
-        meetings
+
+def top_hosts(raw: RawTables) -> pd.DataFrame:
+    return (
+        raw["meetings"]
         .groupby("host_id")
         .agg(meetings_hosted=("id", "count"), avg_duration_min=("duration_min", "mean"))
         .reset_index()
-        .merge(users[["id", "name", "plan"]], left_on="host_id", right_on="id", how="left")
+        .merge(raw["users"][["id", "name", "plan"]], left_on="host_id", right_on="id", how="left")
         .drop(columns=["id"])
-        .sort_values("meetings_hosted", ascending=False)
-        .head(10)
+        .sort_values(["meetings_hosted", "host_id"], ascending=[False, True])
+        .head(TOP_HOSTS_LIMIT)
         .assign(avg_duration_min=lambda df: df["avg_duration_min"].round(0).astype(int))
     )
 
-    rsvp_summary = (
-        rsvps
+
+def rsvp_summary(raw: RawTables) -> pd.DataFrame:
+    return (
+        raw["rsvps"]
         .groupby("rsvp")
-        .agg(count=("meeting_id", "count"))
+        .agg(rsvp_count=("meeting_id", "count"))
         .reset_index()
-        .assign(pct=lambda df: (df["count"] / df["count"].sum() * 100).round(1))
+        .assign(pct=lambda df: (df["rsvp_count"] / df["rsvp_count"].sum() * 100).round(1))
     )
 
-    daily_counts = (
-        messages
-        .assign(date=messages["sent_at"].dt.normalize())
+
+def daily_messages(raw: RawTables) -> pd.DataFrame:
+    """Messages per calendar day, with gaps filled as 0 so the rolling average is honest."""
+    messages = raw["messages"]
+    daily = (
+        messages.assign(date=messages["sent_at"].dt.normalize())
         .groupby("date")
         .agg(messages_sent=("id", "count"))
     )
-    full_date_range = pd.date_range(daily_counts.index.min(), daily_counts.index.max(), freq="D")
-    daily_messages = (
-        daily_counts
-        .reindex(full_date_range, fill_value=0)
+    full_range = pd.date_range(daily.index.min(), daily.index.max(), freq="D")
+    return (
+        daily.reindex(full_range, fill_value=0)
         .rename_axis("date")
         .reset_index()
         .assign(
-            rolling_7d=lambda df: df["messages_sent"].rolling(7, min_periods=1).mean().round(1),
+            rolling_7d=lambda df: (
+                df["messages_sent"].rolling(ROLLING_WINDOW_DAYS, min_periods=1).mean().round(1)
+            ),
+            date=lambda df: df["date"].dt.strftime("%Y-%m-%d"),
         )
     )
 
-    meetings_per_user_by_plan = (
-        users[["id", "plan"]]
-        .merge(
-            meetings.groupby("host_id").agg(meeting_count=("id", "count")).reset_index(),
-            left_on="id", right_on="host_id", how="left",
-        )
-        .assign(meeting_count=lambda df: df["meeting_count"].fillna(0))
+
+def meetings_per_user_by_plan(raw: RawTables) -> pd.DataFrame:
+    """Average meetings hosted per user, including users who hosted none."""
+    hosted = raw["meetings"].groupby("host_id").agg(meeting_count=("id", "count"))
+    return (
+        raw["users"][["id", "plan"]]
+        .merge(hosted, left_on="id", right_index=True, how="left")
+        .fillna({"meeting_count": 0})
         .groupby("plan")
-        .agg(avg_meetings=("meeting_count", "mean"))
+        .agg(avg_meetings=("meeting_count", "mean"), users=("id", "count"))
         .reset_index()
         .assign(avg_meetings=lambda df: df["avg_meetings"].round(1))
     )
 
-    return {
-        "plan_distribution":        plan_distribution,
-        "monthly_signups":          monthly_signups,
-        "monthly_meetings":         monthly_meetings,
-        "top_hosts":                top_hosts,
-        "rsvp_summary":             rsvp_summary,
-        "daily_messages":           daily_messages,
-        "meetings_per_user_by_plan": meetings_per_user_by_plan,
-    }
+
+TRANSFORMS: dict[str, Callable[[RawTables], pd.DataFrame]] = {
+    "plan_distribution": plan_distribution,
+    "monthly_signups": monthly_signups,
+    "monthly_meetings": monthly_meetings,
+    "top_hosts": top_hosts,
+    "rsvp_summary": rsvp_summary,
+    "daily_messages": daily_messages,
+    "meetings_per_user_by_plan": meetings_per_user_by_plan,
+}
+
+
+def transform(raw: RawTables) -> dict[str, pd.DataFrame]:
+    return {name: fn(raw) for name, fn in TRANSFORMS.items()}
 
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 
+
 def load(results: dict[str, pd.DataFrame], target: sqlite3.Connection) -> None:
     for table_name, df in results.items():
         df.to_sql(table_name, target, if_exists="replace", index=False)
-        logging.info("loaded '%s' (%d rows)", table_name, len(df))
+        log.info("loaded '%s' (%d rows)", table_name, len(df))
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
+
 def run() -> None:
     if not SOURCE_DB.exists():
         raise FileNotFoundError(
-            f"Source database not found: {SOURCE_DB}\n"
-            "Run `python generate_data.py` first."
+            f"Source database not found: {SOURCE_DB}\nRun `python generate_data.py` first."
         )
 
-    logging.info("Starting ETL pipeline")
-
-    source = None
-    target = None
-    try:
-        source = sqlite3.connect(SOURCE_DB)
-        target = sqlite3.connect(REPORT_DB)
-
-        logging.info("Extracting...")
+    log.info("Starting ETL pipeline")
+    with (
+        closing(sqlite3.connect(SOURCE_DB)) as source,
+        closing(sqlite3.connect(REPORT_DB)) as target,
+    ):
+        log.info("Extracting...")
         raw = extract(source)
         for name, df in raw.items():
-            logging.info("  %s: %d rows", name, len(df))
+            log.info("  %s: %d rows", name, len(df))
 
-        logging.info("Transforming...")
+        log.info("Transforming...")
         results = transform(raw)
 
-        logging.info("Loading into reporting database...")
+        log.info("Loading into reporting database...")
         load(results, target)
 
-    finally:
-        if source is not None:
-            source.close()
-        if target is not None:
-            target.close()
+    log.info("Pipeline complete → %s", REPORT_DB)
 
-    logging.info("Pipeline complete → %s", REPORT_DB)
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+    )
+    run()
 
 
 if __name__ == "__main__":
-    run()
+    main()

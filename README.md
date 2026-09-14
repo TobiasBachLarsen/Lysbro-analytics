@@ -7,16 +7,17 @@ An ETL data pipeline that extracts, transforms and loads usage data from the [Ly
 ## What it does
 
 ```
-generate_data.py  →  output/lysbro.db          (raw data — simulates production extract)
-etl.py            →  output/lysbro_analytics.db (transformed aggregates)
-analysis.ipynb    →  output/*.png               (charts and insights)
+generate_data.py  →  output/lysbro.db            (synthetic raw data, mirrors the production schema)
+etl.py            →  output/lysbro_analytics.db  (7 reporting tables)
+analysis.ipynb    →  output/*.png                (charts and insights)
+queries.sql       →  example business questions answered against the reporting db
 ```
 
 **Pipeline steps:**
 
-1. **Extract** — reads raw tables (users, meetings, participants, messages) from SQLite
-2. **Transform** — produces 7 analytics aggregates using pandas
-3. **Load** — writes results into a separate reporting database
+1. **Extract** — reads the raw tables (users, meetings, participants, messages) from SQLite and parses timestamps
+2. **Transform** — each reporting table is a small pure function of the raw tables, registered in `TRANSFORMS` in `etl.py`
+3. **Load** — writes the results into a separate reporting database
 
 ---
 
@@ -25,12 +26,12 @@ analysis.ipynb    →  output/*.png               (charts and insights)
 | Table | Description |
 |---|---|
 | `plan_distribution` | User count per subscription tier |
-| `monthly_signups` | New user registrations over time |
-| `monthly_meetings` | Meeting volume + avg participants per month |
-| `top_hosts` | Most active users by meetings hosted |
-| `rsvp_summary` | Meeting invitation acceptance / decline rate |
-| `daily_messages` | Message volume with 7-day rolling average |
-| `meetings_per_user_by_plan` | Avg meetings hosted broken down by plan |
+| `monthly_signups` | New user registrations per month |
+| `monthly_meetings` | Meeting volume and average participants per month |
+| `top_hosts` | Ten most active users by meetings hosted |
+| `rsvp_summary` | Meeting invitation accept / pending / decline split |
+| `daily_messages` | Messages per day (gaps filled with 0) with a 7-day rolling average |
+| `meetings_per_user_by_plan` | Average meetings hosted per user by plan, with sample size |
 
 ---
 
@@ -46,12 +47,11 @@ analysis.ipynb    →  output/*.png               (charts and insights)
 
 ## Tech stack
 
-- **Python 3.12** — pipeline and data generation
-- **pandas** — data transformation and aggregation
-- **SQLite** — lightweight source and reporting database
-- **matplotlib** — visualisations
-- **Jupyter Notebook** — interactive analysis
-- **supabase-py** — production connection layer (see note below)
+- **Python 3.12**
+- **pandas** — transformation and aggregation
+- **SQLite** — source and reporting database
+- **matplotlib** + **Jupyter** — visualisation
+- **pytest** + **ruff** — tests, linting and formatting
 
 ---
 
@@ -60,21 +60,30 @@ analysis.ipynb    →  output/*.png               (charts and insights)
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # or requirements.txt for runtime only
 ```
 
 **Run the full pipeline:**
 
 ```bash
-python generate_data.py   # generate test data
-python etl.py             # run ETL
-jupyter notebook analysis.ipynb  # open visualisations
+python generate_data.py                       # generate synthetic source data
+python etl.py                                 # run ETL
+jupyter nbconvert --execute --inplace analysis.ipynb   # or open it interactively
+```
+
+**Check the code:**
+
+```bash
+pytest
+ruff check . && ruff format --check .
 ```
 
 ---
 
 ## Note on data
 
-`generate_data.py` creates realistic synthetic data (28 users, ~170 meetings, 500 messages) that mirrors the Lysbro production schema. This keeps the repo self-contained and avoids exposing real user data.
+`generate_data.py` creates deterministic synthetic data (28 users, roughly 190 meetings, 500 messages) that mirrors the Lysbro production schema. This keeps the repo self-contained and avoids exposing real user data.
 
-In production, `etl.py` would connect directly to the Supabase PostgreSQL database using the connection string from `.env`.
+The generator guarantees a few invariants that the tests enforce: no meeting is scheduled before its host signed up, nobody is invited to a meeting scheduled before they signed up, and `participant_count` always matches the participant rows.
+
+In production the extract step would read from the Supabase PostgreSQL database instead of `output/lysbro.db`; the rest of the pipeline is unchanged.

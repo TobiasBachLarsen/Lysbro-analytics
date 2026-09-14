@@ -15,10 +15,10 @@ LIMIT 5;
 -- Hvad er den samlede accept-rate på mødeindvitationer?
 SELECT
     rsvp,
-    count,
+    rsvp_count,
     pct || '%' AS pct
 FROM rsvp_summary
-ORDER BY count DESC;
+ORDER BY rsvp_count DESC;
 
 -- Hvilken måned havde flest møder?
 SELECT month, meeting_count, avg_participants
