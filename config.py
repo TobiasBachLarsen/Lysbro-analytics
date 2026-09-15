@@ -8,8 +8,8 @@ REPORT_DB = OUTPUT_DIR / "lysbro_analytics.db"
 
 # ── Synthetic data generation ────────────────────────────────────────────────
 RANDOM_SEED = 42
-DATE_START = "2025-01-01"
-DATE_END = "2026-06-01"
+DATE_START = "2026-01-01"
+DATE_END = "2026-09-01"
 
 PLANS = ["gratis", "pro", "erhverv"]
 PLAN_WEIGHTS = [0.70, 0.22, 0.08]

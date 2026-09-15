@@ -7,7 +7,6 @@ An ETL data pipeline that extracts, transforms and loads usage data from the [Ly
 ## What it does
 
 ```
-generate_data.py  →  output/lysbro.db            (synthetic raw data, mirrors the production schema)
 etl.py            →  output/lysbro_analytics.db  (7 reporting tables)
 analysis.ipynb    →  output/*.png                (charts and insights)
 queries.sql       →  example business questions answered against the reporting db
@@ -15,8 +14,12 @@ queries.sql       →  example business questions answered against the reporting
 
 **Pipeline steps:**
 
-1. **Extract** — reads the raw tables (users, meetings, participants, messages) from SQLite and parses timestamps
-2. **Transform** — each reporting table is a small pure function of the raw tables, registered in `TRANSFORMS` in `etl.py`
+1. **Extract** — reads the raw tables from the live Lysbro **Supabase** database when
+   `DATABASE_URL` is set (`extract_supabase` in `etl.py`), mapping the production schema
+   onto the shape the transforms expect and replacing user names with anonymous labels;
+   otherwise falls back to a local synthetic SQLite source so the pipeline still runs.
+2. **Transform** — each reporting table is a small pure function of the raw tables,
+   registered in `TRANSFORMS` in `etl.py`
 3. **Load** — writes the results into a separate reporting database
 
 ---
@@ -66,9 +69,13 @@ pip install -r requirements-dev.txt   # or requirements.txt for runtime only
 **Run the full pipeline:**
 
 ```bash
-python generate_data.py                       # generate synthetic source data
-python etl.py                                 # run ETL
+# Against live data: set DATABASE_URL (Supabase connection string) in .env, then:
+python etl.py
 jupyter nbconvert --execute --inplace analysis.ipynb   # or open it interactively
+
+# Self-contained, no database access: generate a synthetic source first
+python generate_data.py
+python etl.py
 ```
 
 **Check the code:**
@@ -82,8 +89,13 @@ ruff check . && ruff format --check .
 
 ## Note on data
 
-`generate_data.py` creates deterministic synthetic data (28 users, roughly 190 meetings, 500 messages) that mirrors the Lysbro production schema. This keeps the repo self-contained and avoids exposing real user data.
+The committed charts are built from the **real Lysbro production database** (Supabase),
+**anonymised in the pipeline**: `extract_supabase` replaces every user name with an
+anonymous label (`Bruger 1`, `Bruger 2`, …) before anything is aggregated, and only the
+aggregate reporting tables — never raw rows or names — feed the charts. The reporting and
+source databases (`output/*.db`) are gitignored, so no personal data is committed.
 
-The generator guarantees a few invariants that the tests enforce: no meeting is scheduled before its host signed up, nobody is invited to a meeting scheduled before they signed up, and `participant_count` always matches the participant rows.
-
-In production the extract step would read from the Supabase PostgreSQL database instead of `output/lysbro.db`; the rest of the pipeline is unchanged.
+For a self-contained run without database access, `generate_data.py` creates deterministic
+synthetic data in the same schema. The generator guarantees a few invariants that the tests
+enforce: no meeting is scheduled before its host signed up, nobody is invited to a meeting
+scheduled before they signed up, and `participant_count` always matches the participant rows.

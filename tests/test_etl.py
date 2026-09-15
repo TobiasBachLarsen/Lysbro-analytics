@@ -85,3 +85,11 @@ def test_meetings_per_user_by_plan_includes_users_without_meetings(raw):
 
 def test_transform_produces_every_registered_table(raw):
     assert set(etl.transform(raw)) == set(etl.TRANSFORMS)
+
+
+def test_parse_minutes_pulls_leading_number_and_handles_blanks():
+    import numpy as np
+
+    result = etl._parse_minutes(pd.Series(["30 min", "60 min", "120 min", None, ""]))
+    assert list(result[:3]) == [30.0, 60.0, 120.0]
+    assert np.isnan(result[3]) and np.isnan(result[4])
