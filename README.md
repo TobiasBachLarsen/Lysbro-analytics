@@ -69,14 +69,17 @@ pip install -r requirements-dev.txt   # or requirements.txt for runtime only
 **Run the full pipeline:**
 
 ```bash
-# Against live data: set DATABASE_URL (Supabase connection string) in .env, then:
-python etl.py
-jupyter nbconvert --execute --inplace analysis.ipynb   # or open it interactively
-
-# Self-contained, no database access: generate a synthetic source first
+# Self-contained, no database access (the default): generate a synthetic source first
 python generate_data.py
-python etl.py
+python etl.py                       # same as --source synthetic
+
+# Against live data: set DATABASE_URL (Supabase connection string) in .env, then:
+python etl.py --source supabase
+jupyter nbconvert --execute --inplace analysis.ipynb   # or open it interactively
 ```
+
+The source is always chosen explicitly, and the reporting database records which one it
+was built from (`pipeline_meta` table), so synthetic numbers can't be mistaken for real ones.
 
 **Check the code:**
 

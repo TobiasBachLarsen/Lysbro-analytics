@@ -29,4 +29,5 @@ LIMIT 3;
 -- Top 5 mest aktive brugere
 SELECT name, plan, meetings_hosted, avg_duration_min
 FROM top_hosts
+ORDER BY meetings_hosted DESC, host_id
 LIMIT 5;
