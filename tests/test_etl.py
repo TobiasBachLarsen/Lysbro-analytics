@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -93,3 +94,29 @@ def test_parse_minutes_pulls_leading_number_and_handles_blanks():
     result = etl._parse_minutes(pd.Series(["30 min", "60 min", "120 min", None, ""]))
     assert list(result[:3]) == [30.0, 60.0, 120.0]
     assert np.isnan(result[3]) and np.isnan(result[4])
+
+
+def test_daily_messages_handles_no_messages_at_all():
+    empty = pd.DataFrame({"id": pd.Series(dtype=str), "sent_at": pd.Series(dtype="datetime64[ns]")})
+    df = etl.daily_messages({"messages": empty})
+    assert df.empty
+    assert list(df.columns) == ["date", "messages_sent", "rolling_7d"]
+
+
+def test_top_hosts_keeps_unknown_duration_as_missing_not_zero(raw):
+    meetings = raw["meetings"].copy()
+    meetings.loc[meetings["host_id"] == 1, "duration_min"] = np.nan
+    df = etl.top_hosts({**raw, "meetings": meetings}).set_index("host_id")
+    assert pd.isna(df.loc[1, "avg_duration_min"])
+
+
+def test_run_rejects_unknown_source():
+    with pytest.raises(ValueError):
+        etl.run("production")
+
+
+def test_to_local_naive_counts_evening_messages_on_the_danish_day():
+    # 23:30 Danish summer time is 21:30 UTC; the day bucket must be the Danish date.
+    utc = pd.Series(pd.to_datetime(["2026-05-01T21:30:00Z"]))
+    local = etl._to_local_naive(utc)
+    assert local.iloc[0] == pd.Timestamp("2026-05-01 23:30:00")

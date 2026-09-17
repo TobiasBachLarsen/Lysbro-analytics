@@ -2,13 +2,15 @@
 ETL pipeline — extracts raw Lysbro data, transforms it into analytics-ready
 aggregates, and loads results into a separate reporting database.
 
-The extract reads the live Lysbro Supabase database when DATABASE_URL is set
-(see extract_supabase), and otherwise falls back to the local synthetic SQLite
-source so the pipeline still runs self-contained. Either way the transforms and
-load stay the same. Each aggregate is a small pure function of the raw tables
+The source is chosen explicitly: `--source supabase` reads the live Lysbro database
+(DATABASE_URL, see extract_supabase), `--source synthetic` (the default) reads the local
+SQLite database made by generate_data.py, so the pipeline runs self-contained. Which one
+produced the reporting database is recorded in its `pipeline_meta` table. Either way the
+transforms and load stay the same. Each aggregate is a small pure function of the raw tables
 (see TRANSFORMS), which keeps them individually testable.
 """
 
+import argparse
 import logging
 import os
 import sqlite3
@@ -33,6 +35,8 @@ SOURCE_TABLES = {
 TIMESTAMP_COLUMNS = ("created_at", "scheduled_at", "sent_at")
 TOP_HOSTS_LIMIT = 10
 ROLLING_WINDOW_DAYS = 7
+# Lysbro's users are Danish; days and months are counted in their local time, not UTC.
+LOCAL_TZ = "Europe/Copenhagen"
 
 
 # ── Extract ───────────────────────────────────────────────────────────────────
@@ -60,17 +64,27 @@ def extract_supabase(conn) -> RawTables:
     instead of users, invite messages instead of an rsvp table, a lobby instead of a
     participant count), so this maps it across. User names are replaced with anonymous
     labels here, so no personal data ever reaches the reporting database or the charts."""
-    # Cast uuid columns to text so they load into SQLite cleanly.
+    # plan has a database default of 'gratis'; treat a NULL the same way rather than
+    # letting pandas silently drop those users from every per-plan grouping.
     users = pd.read_sql(
-        "SELECT id::text AS id, plan, created_at FROM profiles ORDER BY created_at", conn
+        "SELECT id::text AS id, COALESCE(plan, 'gratis') AS plan, created_at "
+        "FROM profiles ORDER BY created_at",
+        conn,
     )
-    users["name"] = [f"Bruger {i}" for i in range(1, len(users) + 1)]
+    # Anonymise: the reporting database gets a running number instead of the profile
+    # uuid, and "Bruger N" instead of the name, so nothing in it identifies a person.
+    anon_id = {uuid: n for n, uuid in enumerate(users["id"], start=1)}
+    users["id"] = users["id"].map(anon_id)
+    users["name"] = [f"Bruger {n}" for n in users["id"]]
 
+    # A meeting's time is its scheduled date and time (text columns "2026-04-25" and
+    # "13:00", entered by the host in local time), not created_at, which is when it was
+    # booked. Duration is free text ("60 min") and may be missing for quick-start meetings.
     meetings = pd.read_sql(
         """
         SELECT m.id::text      AS id,
                m.user_id::text AS host_id,
-               m.created_at     AS scheduled_at,
+               (m.date || ' ' || COALESCE(NULLIF(m.time, ''), '00:00'))::timestamp AS scheduled_at,
                m.duration,
                (SELECT count(*) FROM meeting_lobby l
                  WHERE l.meeting_id = m.id::text AND l.status = 'admitted') AS participant_count
@@ -78,6 +92,7 @@ def extract_supabase(conn) -> RawTables:
         """,
         conn,
     )
+    meetings["host_id"] = meetings["host_id"].map(anon_id)
     meetings["duration_min"] = _parse_minutes(meetings["duration"])
     meetings = meetings.drop(columns=["duration"])
 
@@ -88,14 +103,26 @@ def extract_supabase(conn) -> RawTables:
         conn,
     )
 
-    messages = pd.read_sql("SELECT id::text AS id, created_at AS sent_at FROM messages", conn)
+    # Only chat messages count as messages; meeting and organisation invitations are
+    # also rows in `messages` (type 'meeting_invite' / 'org_invite') but are not chat.
+    messages = pd.read_sql(
+        "SELECT id::text AS id, created_at AS sent_at FROM messages WHERE type = 'text'", conn
+    )
 
     raw: RawTables = {"users": users, "meetings": meetings, "rsvps": rsvps, "messages": messages}
+    # created_at / sent_at are timestamptz (UTC) and are shifted to Danish wall-clock time
+    # before the day and month buckets are made; scheduled_at is already wall-clock.
     for df in raw.values():
-        for col in TIMESTAMP_COLUMNS:
+        for col in ("created_at", "sent_at"):
             if col in df.columns:
-                df[col] = pd.to_datetime(df[col], utc=True).dt.tz_localize(None)
+                df[col] = _to_local_naive(df[col])
+    meetings["scheduled_at"] = pd.to_datetime(meetings["scheduled_at"])
     return raw
+
+
+def _to_local_naive(series: pd.Series) -> pd.Series:
+    """UTC timestamps -> naive timestamps in Danish local time."""
+    return pd.to_datetime(series, utc=True).dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
 
 
 # ── Transform ─────────────────────────────────────────────────────────────────
@@ -140,7 +167,8 @@ def top_hosts(raw: RawTables) -> pd.DataFrame:
         .drop(columns=["id"])
         .sort_values(["meetings_hosted", "host_id"], ascending=[False, True])
         .head(TOP_HOSTS_LIMIT)
-        .assign(avg_duration_min=lambda df: df["avg_duration_min"].round(0).fillna(0).astype(int))
+        # A host whose meetings all lack a duration has an unknown average, not 0.
+        .assign(avg_duration_min=lambda df: df["avg_duration_min"].round(0).astype("Int64"))
     )
 
 
@@ -157,6 +185,8 @@ def rsvp_summary(raw: RawTables) -> pd.DataFrame:
 def daily_messages(raw: RawTables) -> pd.DataFrame:
     """Messages per calendar day, with gaps filled as 0 so the rolling average is honest."""
     messages = raw["messages"]
+    if messages.empty:
+        return pd.DataFrame(columns=["date", "messages_sent", "rolling_7d"])
     daily = (
         messages.assign(date=messages["sent_at"].dt.normalize())
         .groupby("date")
@@ -217,13 +247,24 @@ def load(results: dict[str, pd.DataFrame], target: sqlite3.Connection) -> None:
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
 
-def run() -> None:
-    load_dotenv()
-    database_url = os.environ.get("DATABASE_URL")
+SOURCES = ("synthetic", "supabase")
 
-    log.info("Starting ETL pipeline")
+
+def run(source_name: str = "synthetic") -> None:
+    if source_name not in SOURCES:
+        raise ValueError(f"source must be one of {SOURCES}, got {source_name!r}")
+
+    log.info("Starting ETL pipeline (source: %s)", source_name)
     with closing(sqlite3.connect(REPORT_DB)) as target:
-        if database_url:
+        if source_name == "supabase":
+            load_dotenv()
+            database_url = os.environ.get("DATABASE_URL")
+            if not database_url:
+                raise RuntimeError(
+                    "--source supabase needs DATABASE_URL (Supabase connection string) in .env"
+                )
+            # SQLAlchemy only knows the postgresql:// scheme; Supabase hands out postgres://.
+            database_url = database_url.replace("postgres://", "postgresql://", 1)
             log.info("Extracting from Supabase (live production data)...")
             from sqlalchemy import create_engine
 
@@ -236,9 +277,8 @@ def run() -> None:
         else:
             if not SOURCE_DB.exists():
                 raise FileNotFoundError(
-                    f"No DATABASE_URL set and no local source database at {SOURCE_DB}.\n"
-                    "Set DATABASE_URL in .env to use live data, or run "
-                    "`python generate_data.py` first."
+                    f"No local source database at {SOURCE_DB}. "
+                    "Run `python generate_data.py` first, or use --source supabase."
                 )
             log.info("Extracting from local synthetic database...")
             with closing(sqlite3.connect(SOURCE_DB)) as source:
@@ -253,6 +293,12 @@ def run() -> None:
         log.info("Loading into reporting database...")
         load(results, target)
 
+        # Record where the numbers came from, so a chart can never be mistaken for the
+        # other source.
+        pd.DataFrame(
+            {"source": [source_name], "extracted_at": [pd.Timestamp.now(tz="UTC").isoformat()]}
+        ).to_sql("pipeline_meta", target, if_exists="replace", index=False)
+
     log.info("Pipeline complete → %s", REPORT_DB)
 
 
@@ -260,7 +306,15 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
     )
-    run()
+    parser = argparse.ArgumentParser(description="Build the Lysbro reporting database.")
+    parser.add_argument(
+        "--source",
+        choices=SOURCES,
+        default="synthetic",
+        help="synthetic: local SQLite made by generate_data.py (default); "
+        "supabase: the live Lysbro database via DATABASE_URL",
+    )
+    run(parser.parse_args().source)
 
 
 if __name__ == "__main__":
